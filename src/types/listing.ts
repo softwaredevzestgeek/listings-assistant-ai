@@ -13,6 +13,8 @@ export interface ListingRef {
   id: string;
   name: string;
   category: Listing["category"];
+  city: string;
+  priceTier: Listing["priceTier"];
   externalUrl: string | null;
 }
 

@@ -1,5 +1,12 @@
 import { createOpenAI } from "@ai-sdk/openai";
-import { streamText, tool, StreamData } from "ai";
+import {
+  streamText,
+  tool,
+  StreamData,
+  type TextStreamPart,
+  type ToolSet,
+  type StreamTextTransform,
+} from "ai";
 import { z } from "zod";
 import { searchListings, getListingById } from "@/lib/listings";
 import { validateAndStripListingRefs } from "@/lib/validation";
@@ -58,12 +65,70 @@ export async function POST(req: Request) {
   const referencedListings: Listing[] = [];
 
   const streamData = new StreamData();
+  const allViolations: string[] = [];
+
+  // Live redaction transform: enforces guardrail #5 ON the streamed output.
+  // Tools run before the model emits final text, so approvedIds/approvedUrls
+  // are fully populated by the time text-deltas arrive. We buffer text until a
+  // whitespace boundary so listing IDs / URLs are never split across chunks,
+  // then redact any reference not in the approved tool-result set for this turn.
+  const redactStream =
+    <TOOLS extends ToolSet>(): StreamTextTransform<TOOLS> =>
+    () => {
+      let buffer = "";
+      const redact = (chunk: string): string => {
+        const { text, violations } = validateAndStripListingRefs(
+          chunk,
+          approvedIds,
+          approvedUrls
+        );
+        if (violations.length > 0) allViolations.push(...violations);
+        return text;
+      };
+      return new TransformStream<
+        TextStreamPart<TOOLS>,
+        TextStreamPart<TOOLS>
+      >({
+        transform(part, controller) {
+          if (part.type === "text-delta") {
+            buffer += part.textDelta;
+            const lastWs = Math.max(
+              buffer.lastIndexOf(" "),
+              buffer.lastIndexOf("\n")
+            );
+            if (lastWs >= 0) {
+              const flushable = buffer.slice(0, lastWs + 1);
+              buffer = buffer.slice(lastWs + 1);
+              controller.enqueue({
+                ...part,
+                textDelta: redact(flushable),
+              });
+            }
+            return;
+          }
+          // Flush any buffered text before passing through non-text parts so
+          // ordering (e.g. finish events) is preserved.
+          if (buffer) {
+            controller.enqueue({ type: "text-delta", textDelta: redact(buffer) });
+            buffer = "";
+          }
+          controller.enqueue(part);
+        },
+        flush(controller) {
+          if (buffer) {
+            controller.enqueue({ type: "text-delta", textDelta: redact(buffer) });
+            buffer = "";
+          }
+        },
+      });
+    };
 
   const result = streamText({
     model: openai("gpt-4o-mini"),
     system: SYSTEM_PROMPT,
     messages: messages as Parameters<typeof streamText>[0]["messages"],
     maxSteps: 5,
+    experimental_transform: redactStream(),
     tools: {
       searchListings: tool({
         description:
@@ -117,14 +182,14 @@ export async function POST(req: Request) {
   });
 
   // result.text resolves after ALL steps (including multi-step tool calls) finish.
-  // Tie StreamData lifecycle to it — this is more reliable than onFinish async.
+  // Redaction already happened live in experimental_transform; here we just emit
+  // the validated structured refs and log any violations that were stripped.
   result.text
-    .then((text) => {
-      const { violations } = validateAndStripListingRefs(text, approvedIds);
-      if (violations.length > 0) {
+    .then(() => {
+      if (allViolations.length > 0) {
         console.error(
-          `[security] Blocked ${violations.length} unapproved listing reference(s):`,
-          violations
+          `[security] Blocked ${allViolations.length} unapproved reference(s) in output:`,
+          allViolations
         );
       }
 
@@ -140,6 +205,8 @@ export async function POST(req: Request) {
             id: l.id,
             name: l.name,
             category: l.category,
+            city: l.city,
+            priceTier: l.priceTier,
             externalUrl: l.externalUrl,
           }));
 

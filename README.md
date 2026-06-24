@@ -4,9 +4,9 @@ A grounded AI assistant that recommends places **only** from a fixed synthetic d
 
 ## Stack
 
-- **Next.js 15** (App Router, targeting Next.js 16 spec) + **React 19** + **TypeScript strict**
+- **Next.js 16** (App Router, Turbopack) + **React 19** + **TypeScript strict**
 - **Vercel AI SDK** (`ai` v4) — `streamText` with tool-calling
-- **Anthropic Claude** (`claude-sonnet-4-6`) via `@ai-sdk/anthropic`
+- **OpenAI** (`gpt-4o-mini`) via `@ai-sdk/openai`
 - **Zod** for typed tool parameter schemas
 - **Vitest** for eval/test cases
 
@@ -16,14 +16,15 @@ A grounded AI assistant that recommends places **only** from a fixed synthetic d
 
 ```bash
 # 1. Clone / enter the project
-cd local-listings-chat
+git clone git@github.com:softwaredevzestgeek/listings-assistant-ai.git
+cd listings-assistant-ai
 
 # 2. Install dependencies
 npm install
 
 # 3. Set your API key
 cp .env.example .env.local
-# Edit .env.local and set ANTHROPIC_API_KEY=sk-ant-...
+# Edit .env.local and set OPENAI_API_KEY=sk-proj-...
 
 # 4. Start dev server
 npm run dev
@@ -50,14 +51,14 @@ src/
   app/
     api/chat/route.ts              ← POST /api/chat — streamText + tools + validation
     page.tsx                       ← Chat UI (useChat hook, listing chips)
-  __tests__/chat.test.ts           ← 15 eval test cases
+  __tests__/chat.test.ts           ← eval test cases (17, all green)
 ```
 
 ### Guardrail layers
 
-1. **System prompt** — instructs Claude to only reference tool results, never invent, never go off-topic.
+1. **System prompt** — instructs the model to only reference tool results, never invent, never go off-topic.
 2. **Tool gating** — the model can only access data via `searchListings` and `getListingById`. No raw dataset in the prompt.
-3. **Server-side validation** — after streaming, `validateAndStripListingRefs` regex-scans the final assistant text for `xxx-NNN` ID patterns. Any ID not in the tool-result set for that turn is redacted and the violation is logged to the server console.
+3. **Server-side validation (enforced on the live stream)** — `validateAndStripListingRefs` runs inside an `experimental_transform` on the streamed output. It buffers text to whitespace boundaries (so IDs/URLs are never split across chunks) and redacts, in the bytes the client actually receives, any `xxx-NNN` listing ID **or** `http(s)` URL that is not in the tool-result set for that turn. Every redaction is logged to the server console. The structured `listing_refs` appended to the stream are likewise filtered to approved IDs only — so cards can never reference anything outside the dataset.
 
 ---
 
@@ -87,6 +88,8 @@ The stream delivers two kinds of chunks:
     id: string;          // e.g. "din-001"
     name: string;        // e.g. "The Mill House Cafe"
     category: "dining" | "lodging" | "attraction" | "venue";
+    city: string;        // e.g. "Brookline"
+    priceTier: "$" | "$$" | "$$$" | "$$$$" | "free";
     externalUrl: string | null; // verified against dataset; never constructed
   }>;
 }
@@ -98,15 +101,15 @@ Front-end clients use `useChat` from `ai/react` and read `data` from the hook. T
 
 ## Eval / Test Cases
 
-`src/__tests__/chat.test.ts` covers 5 scenarios at the data/guardrail layer (no LLM calls needed):
+`src/__tests__/chat.test.ts` covers the required scenarios at the data/guardrail layer (no LLM calls needed — fast and deterministic):
 
 | # | Scenario | What is tested |
 |---|---|---|
-| 1 | Normal recommendation query | `searchListings("italian")` returns real dataset members |
-| 2 | Out-of-scope request | Flight queries return no listings; dataset is not polluted |
-| 3 | Prompt injection | `validateAndStripListingRefs` removes hallucinated IDs not in approved set |
+| 1 | Normal recommendation query | `searchListings(...)` returns real dataset members only |
+| 2 | Out-of-scope request | Flight/nonsense queries return no listings; dataset is not polluted |
+| 3 | Prompt injection | `validateAndStripListingRefs` removes hallucinated IDs not in the approved set |
 | 4 | Invented listing | `getListingById("lod-999")` returns null; search never returns non-dataset items |
-| 5 | Link handling | All `externalUrl` values exist and are non-empty; URLs are not affected by ID validation |
+| 5 | Link handling | Unapproved URLs are redacted (incl. trailing punctuation); approved URLs pass through; all `externalUrl` values are string-or-null |
 
 Run: `npm run test`
 
@@ -117,15 +120,15 @@ Run: `npm run test`
 The provider is isolated to one import in `src/app/api/chat/route.ts`:
 
 ```ts
-// Anthropic (default)
+// OpenAI (default)
+import { createOpenAI } from "@ai-sdk/openai";
+const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const model = openai("gpt-4o-mini");
+
+// Anthropic (swap)
 import { createAnthropic } from "@ai-sdk/anthropic";
 const anthropic = createAnthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const model = anthropic("claude-sonnet-4-6");
-
-// OpenAI (swap)
-import { createOpenAI } from "@ai-sdk/openai";
-const openai = createOpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const model = openai("gpt-4o");
 ```
 
 Everything else (tools, system prompt, validation) stays the same.
@@ -144,4 +147,3 @@ Why not Vapi: this stack lets us own each layer independently — swap Deepgram 
 1. **Rate limiting** — Upstash Redis + `@upstash/ratelimit` on `/api/chat` per IP/session to prevent dataset-exhaustion probing.
 2. **Structured violation logging** — Pino JSON logs for every `validateAndStripListingRefs` violation, shipped to a log aggregator, so hallucination drift is auditable over time.
 
-**AI coding tools used:** Claude Code (Anthropic).

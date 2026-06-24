@@ -85,11 +85,41 @@ describe("Eval: Link handling", () => {
     });
   });
 
-  it("validateAndStripListingRefs does not affect URLs", () => {
+  it("leaves URLs untouched when no approved-URL set is supplied (back-compat)", () => {
     const text = "Visit https://example.com/mill-house-cafe for more info.";
     const approved = new Set<string>();
     const { text: cleaned } = validateAndStripListingRefs(text, approved);
     expect(cleaned).toContain("https://example.com/mill-house-cafe");
+  });
+
+  it("keeps an approved URL and redacts an unapproved one", () => {
+    const real = "https://millhousecafe.example/booking";
+    const fake = "https://totally-made-up-place.example";
+    const text = `Try ${real} or maybe ${fake} instead.`;
+    const approvedIds = new Set<string>();
+    const approvedUrls = new Set<string>([real]);
+    const { text: cleaned, violations } = validateAndStripListingRefs(
+      text,
+      approvedIds,
+      approvedUrls
+    );
+    expect(cleaned).toContain(real);
+    expect(cleaned).not.toContain(fake);
+    expect(violations).toContain(fake);
+  });
+
+  it("redacts an unapproved URL even with trailing punctuation", () => {
+    const fake = "https://invented.example/page";
+    const text = `Check it out at ${fake}.`;
+    const { text: cleaned, violations } = validateAndStripListingRefs(
+      text,
+      new Set<string>(),
+      new Set<string>()
+    );
+    expect(violations).toContain(fake);
+    expect(cleaned).not.toContain("invented.example");
+    // The trailing period is preserved outside the redaction.
+    expect(cleaned).toContain("[REDACTED].");
   });
 
   it("all listing IDs follow the xxx-NNN format", () => {
